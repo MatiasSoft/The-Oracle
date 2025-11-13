@@ -6,6 +6,42 @@ if (!process.env.API_KEY) {
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
 
+// Función helper para reintentos con backoff exponencial
+const retryWithBackoff = async <T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 3,
+  initialDelay: number = 1000
+): Promise<T> => {
+  let lastError: any;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      
+      // Verificar si es un error 503 (servicio sobrecargado)
+      const is503Error = error?.message?.includes('503') || 
+                        error?.message?.includes('overloaded') ||
+                        error?.message?.includes('UNAVAILABLE');
+      
+      // Si es el último intento o no es un error 503, lanzar el error
+      if (attempt === maxRetries - 1 || !is503Error) {
+        throw error;
+      }
+      
+      // Calcular delay con backoff exponencial
+      const delay = initialDelay * Math.pow(2, attempt);
+      console.log(`Intento ${attempt + 1}/${maxRetries} falló. Reintentando en ${delay}ms...`);
+      
+      // Esperar antes del próximo intento
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  throw lastError;
+};
+
 export interface ValidationAnalysis {
   appliedTechniques: string[];
   functionalEquivalence: string;
@@ -51,13 +87,15 @@ ${instructions}
 `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: model,
-            contents: prompt,
-            config: {
-                ...(seed && { seed })
-            }
-        });
+        const response = await retryWithBackoff(async () => {
+            return await ai.models.generateContent({
+                model: model,
+                contents: prompt,
+                config: {
+                    ...(seed && { seed })
+                }
+            });
+        }, 3, 2000); // 3 intentos, delay inicial de 2 segundos
         
         let newCode = response.text.trim();
         // Clean up markdown fences if the model includes them despite instructions
@@ -68,9 +106,12 @@ ${instructions}
             newCode = newCode.substring(0, newCode.length - 3);
         }
         return newCode.trim();
-    } catch (error) {
+    } catch (error: any) {
         console.error("Error calling Gemini API for rewrite:", error);
-        throw new Error("Failed to generate rewritten code.");
+        const errorMessage = error?.message?.includes('overloaded') || error?.message?.includes('503')
+            ? "El servicio de IA está temporalmente sobrecargado. Por favor, espera unos momentos e intenta nuevamente."
+            : "Error al generar el código reescrito. Por favor, verifica tu conexión e intenta de nuevo.";
+        throw new Error(errorMessage);
     }
 };
 
@@ -137,19 +178,24 @@ ${generatedCode}
 `;
 
     try {
-        const response = await ai.models.generateContent({
-            model: model,
-            contents: prompt,
-            config: {
-                responseMimeType: "application/json",
-                responseSchema: schema,
-            }
-        });
+        const response = await retryWithBackoff(async () => {
+            return await ai.models.generateContent({
+                model: model,
+                contents: prompt,
+                config: {
+                    responseMimeType: "application/json",
+                    responseSchema: schema,
+                }
+            });
+        }, 3, 2000); // 3 intentos, delay inicial de 2 segundos
         
         const jsonText = response.text.trim();
         return JSON.parse(jsonText);
-    } catch (error) {
+    } catch (error: any) {
         console.error("Error calling or parsing Gemini API for validation:", error);
-        throw new Error("Failed to get or parse code validation.");
+        const errorMessage = error?.message?.includes('overloaded') || error?.message?.includes('503')
+            ? "El servicio de IA está temporalmente sobrecargado. Por favor, espera unos momentos e intenta nuevamente."
+            : "Error al validar el código. Por favor, verifica tu conexión e intenta de nuevo.";
+        throw new Error(errorMessage);
     }
 };
